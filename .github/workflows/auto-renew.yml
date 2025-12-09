@@ -2,7 +2,7 @@ name: Auto Renew Skybots
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天运行一次
+    - cron: '0 1 * * *'  # 每天凌晨1点运行 (UTC时间，北京时间早上9点)
   workflow_dispatch:  # 允许手动触发
 
 jobs:
@@ -20,167 +20,159 @@ jobs:
       - name: Install dependencies
         run: |
           pip install selenium
+          # 保持手动安装 Chrome 以确保环境一致性
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
-
-      - name: Install ChromeDriver
-        uses: nanasess/setup-chromedriver@v2
 
       - name: Run renewal
         id: renew
         env:
           COOKIES: ${{ secrets.SKYBOTS_COOKIES }}
         run: |
-          python - << 'EOF' | tee output.log
-          import os, time
+          # 使用 > output.log 将标准输出(stdout)重定向到文件
+          # 使用 sys.stderr 将日志输出到屏幕，确保能看到续期结果
+          python - << 'EOF' > output.log
+          import os
+          import time
+          import json
+          import sys
           from selenium import webdriver
-          from selenium.webdriver.common.by import By
           from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.support.ui import WebDriverWait
-          from selenium.webdriver.support import expected_conditions as EC
 
+          # 配置
+          DASHBOARD_URL = 'https://dash.skybots.tech/dashboard/my-projects'
+          API_RENEW_URL = 'https://dash.skybots.tech/api/v1/bots?action=renew'
+          
+          # 获取环境变量
+          cookies_env = os.environ.get('COOKIES', '')
+
+          # 设置 Chrome 选项
           options = Options()
           options.add_argument('--headless=new')
           options.add_argument('--no-sandbox')
           options.add_argument('--disable-dev-shm-usage')
           options.add_argument('--window-size=1920,1080')
-          
+          options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+
           driver = webdriver.Chrome(options=options)
-          wait = WebDriverWait(driver, 15)
           
+          def log(msg):
+              # 写入文件 (因为 stdout 被重定向了)
+              print(f"[Skybots] {msg}")
+              # 写入屏幕 (stderr 不会被重定向，能在 Action 日志中看到)
+              sys.stderr.write(f"[Skybots] {msg}\n")
+              sys.stderr.flush()
+
           try:
+              log("初始化浏览器...")
               driver.get('https://skybots.tech')
               time.sleep(2)
-              
-              # 使用 CDP 设置 cookies
+
+              # -------------------------------------------------
+              # 1. 注入 Cookies
+              # -------------------------------------------------
+              log("注入 Cookies...")
               driver.execute_cdp_cmd('Network.enable', {})
-              for cookie in os.environ['COOKIES'].split('; '):
-                  if '=' not in cookie:
-                      continue
+              
+              if not cookies_env:
+                  raise Exception("Secrets 中未找到 COOKIES")
+
+              for cookie in cookies_env.split('; '):
+                  if '=' not in cookie: continue
                   name, value = cookie.split('=', 1)
-                  name = name.strip()
-                  value = value.strip()
-                  
-                  # 构建 cookie 参数
                   cookie_param = {
-                      'name': name,
-                      'value': value,
-                      'path': '/'
+                      'name': name.strip(),
+                      'value': value.strip(),
+                      'path': '/',
+                      'secure': True
                   }
                   
-                  # __Host- 前缀的 cookie 不能设置 domain
                   if '__Host-' in name:
-                      cookie_param['secure'] = True
-                      cookie_param['sameSite'] = 'None'
                       cookie_param['url'] = 'https://skybots.tech'
                   else:
                       cookie_param['domain'] = '.skybots.tech'
-                      if '__Secure-' in name:
-                          cookie_param['secure'] = True
-                          cookie_param['sameSite'] = 'None'
-                  
+
                   try:
                       driver.execute_cdp_cmd('Network.setCookie', cookie_param)
-                  except Exception as e:
-                      print(f'⚠️ 跳过 {name}: {str(e)[:50]}')
+                  except:
+                      pass
+
+              # -------------------------------------------------
+              # 2. 访问控制台激活 Session
+              # -------------------------------------------------
+              log(f"访问控制台: {DASHBOARD_URL}")
+              driver.get(DASHBOARD_URL)
+              time.sleep(5) 
               
-              driver.get('https://skybots.tech/dashboard/my-projects')
-              
-              # 等待页面加载完成
-              print('等待页面加载...')
-              time.sleep(8)  # 增加等待时间
-              
-              # 检查登录状态
-              if 'discord' in driver.current_url.lower():
-                  print('❌ Cookie 已过期')
+              if 'login' in driver.current_url.lower():
+                  log("❌ Cookie 已失效，重定向到了登录页")
                   exit(1)
               
-              driver.save_screenshot('page.png')
+              # -------------------------------------------------
+              # 3. API 获取 ID 列表 (无需正则，直接调用接口)
+              # -------------------------------------------------
+              log("尝试通过 API 获取 Bot 列表...")
+              found_ids = []
               
-              # 打印页面源码用于调试
-              page_source = driver.page_source
-              print(f'页面长度: {len(page_source)}')
-              print(f'是否包含 Renouveler: {"Renouveler" in page_source}')
+              get_bots_script = """
+              var callback = arguments[0];
+              fetch('/api/v1/bots')
+                  .then(response => response.json())
+                  .then(data => {
+                      // 兼容不同的数据结构返回
+                      var list = Array.isArray(data) ? data : (data.data || data.bots || []);
+                      var ids = list.map(item => item.id || item.botId || item._id).filter(id => id);
+                      callback(JSON.stringify(ids));
+                  })
+                  .catch(err => callback("ERROR: " + err));
+              """
               
-              # 尝试多种方式查找续期按钮
-              renew_button = None
-              
-              # 方法1: 通过 span 文本查找
               try:
-                  renew_button = driver.find_element(By.XPATH, "//button[.//span[text()='Renouveler']]")
-                  print('✓ 通过方法1找到按钮')
-              except:
-                  pass
-              
-              # 方法2: 包含文本的更宽松匹配
-              if not renew_button:
-                  try:
-                      renew_button = driver.find_element(By.XPATH, "//button[contains(., 'Renouveler') and contains(@class, 'yellow')]")
-                      print('✓ 通过方法2找到按钮')
-                  except:
-                      pass
-              
-              # 方法3: 通过类名和SVG查找
-              if not renew_button:
-                  try:
-                      buttons = driver.find_elements(By.XPATH, "//button[contains(@class, 'yellow-500')]")
-                      for btn in buttons:
-                          if 'Renouveler' in btn.text or 'renouveler' in btn.text.lower():
-                              renew_button = btn
-                              print('✓ 通过方法3找到按钮')
-                              break
-                  except:
-                      pass
-              
-              # 方法4: 查找所有包含 Renouveler 的按钮
-              if not renew_button:
-                  try:
-                      all_buttons = driver.find_elements(By.TAG_NAME, "button")
-                      print(f'页面共有 {len(all_buttons)} 个按钮')
-                      for i, btn in enumerate(all_buttons):
-                          btn_text = btn.text.strip()
-                          if btn_text:
-                              print(f'按钮 {i+1}: {btn_text[:50]}')
-                          if 'Renouveler' in btn_text or 'renouveler' in btn_text.lower():
-                              renew_button = btn
-                              print(f'✓ 通过方法4找到按钮 (索引 {i+1})')
-                              break
-                  except Exception as e:
-                      print(f'方法4错误: {str(e)}')
-              
-              if renew_button:
-                  # 检查按钮是否被禁用
-                  is_disabled = renew_button.get_attribute('disabled')
-                  class_names = renew_button.get_attribute('class')
-                  print(f'按钮状态 - disabled: {is_disabled}, classes: {class_names}')
-                  
-                  if is_disabled:
-                      print('⚠️ 续期按钮当前被禁用（可能还未到续期时间）')
+                  api_result = driver.execute_async_script(get_bots_script)
+                  if "ERROR" in str(api_result):
+                      log(f"❌ API 获取列表失败: {api_result}")
                   else:
-                      print('找到可用的续期按钮，准备点击...')
-                      driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", renew_button)
-                      time.sleep(1)
-                      driver.execute_script("arguments[0].click();", renew_button)
-                      time.sleep(3)
-                      
-                      # 处理成功提示
-                      try:
-                          alert = driver.switch_to.alert
-                          print(f'✅ {alert.text}')
-                          alert.accept()
-                      except:
-                          print('无弹窗提示')
-                      
-                      # 输出新 cookies
-                      cookies = '; '.join([f"{c['name']}={c['value']}" for c in driver.get_cookies()])
-                      print(f'NEW_COOKIES={cookies}')
-              else:
-                  print('✅ 未找到续期按钮（可能无需续期或按钮未显示）')
-              
+                      found_ids = json.loads(api_result)
+                      log(f"✅ API 返回的 ID 列表: {found_ids}")
+              except Exception as e:
+                  log(f"❌ 执行 API 脚本出错: {e}")
+
+              if not found_ids:
+                  log("❌ 未找到任何 Bot ID，无法续期。")
+                  exit(1)
+
+              # -------------------------------------------------
+              # 4. 执行 API 续期
+              # -------------------------------------------------
+              for bot_id in found_ids:
+                  log(f"🚀 正在续期 Bot: {bot_id}")
+                  
+                  renew_script = f"""
+                  var callback = arguments[0];
+                  fetch('{API_RENEW_URL}', {{
+                      method: 'POST',
+                      headers: {{ 'Content-Type': 'application/json' }},
+                      body: JSON.stringify({{botId: '{bot_id}'}})
+                  }})
+                  .then(r => r.text())
+                  .then(t => callback(t))
+                  .catch(e => callback("ERROR: " + e));
+                  """
+                  
+                  try:
+                      result = driver.execute_async_script(renew_script)
+                      log(f"API 响应: {result}")
+                  except Exception as e:
+                      log(f"❌ 调用失败: {e}")
+                  
+                  time.sleep(2)
+
+              # 输出新 Cookies (只用 print，这样只去文件，不显示在屏幕防止刷屏)
+              cookies = '; '.join([f"{c['name']}={c['value']}" for c in driver.get_cookies()])
+              print(f'NEW_COOKIES={cookies}')
+
           except Exception as e:
-              print(f'❌ 发生错误: {str(e)}')
-              import traceback
-              traceback.print_exc()
+              log(f"❌ 错误: {str(e)}")
               driver.save_screenshot('error.png')
               exit(1)
           finally:
@@ -193,9 +185,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
         run: |
-          # 提取新的 cookies
           new_cookies=$(grep "NEW_COOKIES=" output.log | cut -d'=' -f2-)
-          
           if [ -n "$new_cookies" ]; then
             echo "正在更新 Secrets..."
             gh secret set SKYBOTS_COOKIES --repo "$REPO" --body "$new_cookies"
@@ -203,11 +193,10 @@ jobs:
           else
             echo "ℹ️ 无需更新 Cookies"
           fi
-
+          
       - name: Upload screenshot
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshot
-          path: "*.png"
-          if-no-files-found: ignore
+          name: error-screenshot
+          path: error.png
